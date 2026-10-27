@@ -360,14 +360,20 @@ export function initCanvas(app) {
     const points = object.type === 'line' ? object.line : object.shape;
     points.forEach((point, index) => {
       const screen = worldToScreen(point.x, point.z);
-      const isHover = editor.hoverVertex?.index === index;
+      const isHover = editor.hoverVertex?.index === index
+        && editor.hoverVertex.setId === found.set.id
+        && editor.hoverVertex.objectId === object.id;
+      const isSelected = editor.selectedVertex
+        && editor.selectedVertex.setId === found.set.id
+        && editor.selectedVertex.objectId === object.id
+        && editor.selectedVertex.index === index;
       ctx.save();
       ctx.beginPath();
-      ctx.arc(screen.x, screen.y, isHover ? 6 : 4.5, 0, Math.PI * 2);
-      ctx.fillStyle = isHover ? '#fff' : '#0d1727';
+      ctx.arc(screen.x, screen.y, isSelected ? 7 : isHover ? 6 : 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = isSelected ? '#fb923c' : isHover ? '#fff' : '#0d1727';
       ctx.fill();
       ctx.lineWidth = 2;
-      ctx.strokeStyle = cssColor(object.lineColor, 1);
+      ctx.strokeStyle = isSelected ? '#fff' : cssColor(object.lineColor, 1);
       ctx.stroke();
       if (index === 0) {
         ctx.beginPath();
@@ -518,14 +524,32 @@ export function initCanvas(app) {
     requestDraw();
   }
 
-  function hitTestVertex(screenX, screenY) {
-    const found = findSelected(app);
-    if (!found) return null;
-    const { object } = found;
-    const points = object.type === 'poi' ? [] : object.type === 'line' ? object.line : object.shape;
+  function hitTestObjectVertex(set, object, screenX, screenY) {
+    if (object.visible === false || object.type === 'poi') return null;
+    const points = object.type === 'line' ? object.line : object.shape;
+    if (!points) return null;
     for (let index = points.length - 1; index >= 0; index -= 1) {
       const point = worldToScreen(points[index].x, points[index].z);
-      if (Math.hypot(point.x - screenX, point.y - screenY) <= 9) return { index, object, set: found.set };
+      if (Math.hypot(point.x - screenX, point.y - screenY) <= 9) return { index, object, set };
+    }
+    return null;
+  }
+
+  function hitTestVertex(screenX, screenY) {
+    const found = findSelected(app);
+    if (found) {
+      const selectedHit = hitTestObjectVertex(found.set, found.object, screenX, screenY);
+      if (selectedHit) return selectedHit;
+    }
+    const sets = app.project.sets.slice().reverse();
+    for (const set of sets) {
+      if (set.visible === false) continue;
+      for (let objectIndex = set.objects.length - 1; objectIndex >= 0; objectIndex -= 1) {
+        const object = set.objects[objectIndex];
+        if (found && set.id === found.set.id && object.id === found.object.id) continue;
+        const hit = hitTestObjectVertex(set, object, screenX, screenY);
+        if (hit) return hit;
+      }
     }
     return null;
   }
@@ -589,6 +613,45 @@ export function initCanvas(app) {
     return null;
   }
 
+  function findInsertionAt(screenX, screenY) {
+    if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
+    const hit = hitTestObject(screenX, screenY);
+    if (!hit || hit.object.type === 'poi') return null;
+    const object = hit.object;
+    const points = object.type === 'line' ? object.line : object.shape;
+    if (!points || points.length < 2) return null;
+    const screenPoints = points.map((point) => worldToScreen(point.x, point.z));
+    const closed = object.type !== 'line';
+    const segmentCount = closed ? screenPoints.length : screenPoints.length - 1;
+    let best = null;
+    for (let index = 0; index < segmentCount; index += 1) {
+      const a = screenPoints[index];
+      const b = screenPoints[(index + 1) % screenPoints.length];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const lengthSq = dx * dx + dy * dy;
+      let t = lengthSq ? ((screenX - a.x) * dx + (screenY - a.y) * dy) / lengthSq : 0;
+      t = clamp(t, 0, 1);
+      const distance = Math.hypot(screenX - (a.x + t * dx), screenY - (a.y + t * dy));
+      if (!best || distance < best.distance) best = { distance, index, t };
+    }
+    if (!best) return null;
+    const a = points[best.index];
+    const b = points[(best.index + 1) % points.length];
+    const point = {
+      x: roundCoord(a.x + (b.x - a.x) * best.t),
+      z: roundCoord(a.z + (b.z - a.z) * best.t)
+    };
+    if (object.type === 'line') {
+      const fromY = Number(a.y);
+      const toY = Number(b.y);
+      const startY = Number.isFinite(fromY) ? fromY : editor.newY;
+      const endY = Number.isFinite(toY) ? toY : editor.newY;
+      point.y = roundCoord(startY + (endY - startY) * best.t);
+    }
+    return { set: hit.set, object, index: best.index + 1, point };
+  }
+
   function pointerPosition(event) {
     const rect = dom.mapCanvas.getBoundingClientRect();
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
@@ -596,7 +659,7 @@ export function initCanvas(app) {
 
   function updateHover(screenX, screenY) {
     const vertex = hitTestVertex(screenX, screenY);
-    editor.hoverVertex = vertex ? { index: vertex.index } : null;
+    editor.hoverVertex = vertex ? { index: vertex.index, setId: vertex.set.id, objectId: vertex.object.id } : null;
     const hit = vertex ? { set: vertex.set, object: vertex.object } : hitTestObject(screenX, screenY);
     if (hit) {
       editor.hover = { setId: hit.set.id, id: hit.object.id };
@@ -659,6 +722,7 @@ export function initCanvas(app) {
       if (vertex) {
         pointer.mode = 'drag-vertex';
         pointer.drag = { object: vertex.object, set: vertex.set, index: vertex.index, start: deepClone(vertex.object), startWorld: world };
+        editor.selectedVertex = { setId: vertex.set.id, objectId: vertex.object.id, index: vertex.index };
         app.beginGroup();
         app.selectObject(vertex.set, vertex.object);
         dom.mapCanvas.setPointerCapture?.(event.pointerId);
@@ -668,6 +732,7 @@ export function initCanvas(app) {
       if (hit) {
         pointer.mode = 'drag-object';
         pointer.drag = { object: hit.object, set: hit.set, start: deepClone(hit.object), startWorld: world };
+        editor.selectedVertex = null;
         app.beginGroup();
         app.selectObject(hit.set, hit.object);
         dom.mapCanvas.setPointerCapture?.(event.pointerId);
@@ -807,6 +872,7 @@ export function initCanvas(app) {
     fitBounds,
     fitProject,
     zoomAt,
+    findInsertionAt,
     draw
   };
 }

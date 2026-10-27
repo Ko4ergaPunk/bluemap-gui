@@ -111,6 +111,7 @@ const editor = {
   activeSetId: project.sets[0]?.id || null,
   hover: null,
   hoverVertex: null,
+  selectedVertex: null,
   draft: null,
   tab: 'object',
   snap: stored?.ui?.snap !== false,
@@ -262,6 +263,14 @@ function updateSelectionValidity() {
   if (editor.activeSetId && !project.sets.some((set) => set.id === editor.activeSetId)) {
     editor.activeSetId = project.sets[0]?.id || null;
   }
+  if (editor.selectedVertex) {
+    const set = project.sets.find((item) => item.id === editor.selectedVertex.setId);
+    const object = set?.objects.find((item) => item.id === editor.selectedVertex.objectId);
+    const list = object && object.type !== 'poi' ? (object.type === 'line' ? object.line : object.shape) : null;
+    if (!list || editor.selectedVertex.index < 0 || editor.selectedVertex.index >= list.length) {
+      editor.selectedVertex = null;
+    }
+  }
 }
 
 function updateHistoryButtons() {
@@ -274,6 +283,7 @@ function undo() {
   history.future.push(serializedProject());
   project = normalizeProject(JSON.parse(history.past.pop()));
   editor.selected = null;
+  editor.selectedVertex = null;
   app.project = project;
   afterChange({ inspector: true });
   updateHistoryButtons();
@@ -287,6 +297,7 @@ function redo() {
   history.past.push(serializedProject());
   project = normalizeProject(JSON.parse(history.future.pop()));
   editor.selected = null;
+  editor.selectedVertex = null;
   app.project = project;
   afterChange({ inspector: true });
   updateHistoryButtons();
@@ -322,6 +333,9 @@ function selectedSet() {
 }
 
 function selectObject(set, object) {
+  if (editor.selectedVertex && (editor.selectedVertex.setId !== set.id || editor.selectedVertex.objectId !== object.id)) {
+    editor.selectedVertex = null;
+  }
   editor.selected = { kind: 'object', setId: set.id, id: object.id };
   editor.activeSetId = set.id;
   renderLayers();
@@ -330,6 +344,7 @@ function selectObject(set, object) {
 }
 
 function selectSet(set) {
+  editor.selectedVertex = null;
   editor.selected = { kind: 'set', id: set.id };
   editor.activeSetId = set.id;
   renderLayers();
@@ -339,6 +354,7 @@ function selectSet(set) {
 
 function clearSelection() {
   editor.selected = null;
+  editor.selectedVertex = null;
   renderLayers();
   renderInspector({ resetScroll: true });
   requestDraw();
@@ -408,9 +424,9 @@ function updateToolUi() {
   dom.mapWrap.classList.remove('tool-select', 'tool-pan', 'tool-marker', 'tool-line', 'tool-shape', 'tool-extrude', 'tool-ruler');
   dom.mapWrap.classList.add(`tool-${editor.tool}`);
   const hints = {
-    select: 'ЛКМ — выбрать · перетаскивание — переместить · ПКМ/пробел — панорама · колесо — масштаб',
+    select: 'ЛКМ — выбрать · перетаскивание — переместить · Delete — удалить точку/объект · ПКМ/пробел — панорама · колесо — масштаб',
     marker: 'Клик — поставить маркер · Esc — выбрать · высота Y задаётся в инспекторе',
-    line: 'Клик — точки · двойной клик или Enter — готово · Esc — отмена · перетаскивание пустого места — панорама',
+    line: 'Клик — точки · клик по линии/области — вставить точку · двойной клик или Enter — готово · Esc — отмена',
     shape: 'Клик — вершины · закройте на первой точке или Enter · Esc — отмена',
     extrude: 'Клик — вершины объёма · Enter или двойной клик — готово · Esc — отмена',
     ruler: 'Клик — измерить отрезки · Enter — оставить · Esc — очистить · Backspace — убрать точку',
@@ -441,6 +457,7 @@ function setTool(tool) {
   editor.tool = tool;
   editor.hover = null;
   editor.hoverVertex = null;
+  editor.selectedVertex = null;
   updateToolUi();
   updateDraftHud();
   requestDraw();
@@ -499,6 +516,18 @@ function addDraftPoint(world) {
   requestDraw();
 }
 
+function insertPointIntoObject({ set, object, index, point }) {
+  const list = object.type === 'line' ? object.line : object.shape;
+  if (!list || index < 0 || index > list.length) return;
+  const before = serializedProject();
+  list.splice(index, 0, point);
+  pushHistory(before);
+  selectObject(set, object);
+  editor.selectedVertex = { setId: set.id, objectId: object.id, index };
+  afterChange({ inspector: true });
+  toast('Точка добавлена', 'ok', 1200);
+}
+
 function finishDraft() {
   const draft = editor.draft;
   if (!draft) return;
@@ -548,12 +577,23 @@ function cancelDraft(silent = false) {
   requestDraw();
 }
 
-function handleCanvasClick(world) {
+function handleCanvasClick(world, screenX, screenY) {
   if (editor.tool === 'marker') {
     createMarkerAt(world);
     return;
   }
-  if (editor.tool === 'line' || editor.tool === 'shape' || editor.tool === 'extrude') {
+  if (editor.tool === 'line') {
+    if (!editor.draft) {
+      const insertion = app.canvas?.findInsertionAt(screenX, screenY);
+      if (insertion) {
+        insertPointIntoObject(insertion);
+        return;
+      }
+    }
+    addDraftPoint(world);
+    return;
+  }
+  if (editor.tool === 'shape' || editor.tool === 'extrude') {
     addDraftPoint(world);
     return;
   }
@@ -606,6 +646,7 @@ function deleteSelectedObject() {
   const before = serializedProject();
   found.set.objects = found.set.objects.filter((item) => item.id !== found.object.id);
   editor.selected = null;
+  editor.selectedVertex = null;
   pushHistory(before);
   afterChange({ inspector: true });
   toast(`Удалено: ${found.object.label}`, 'info', 1600);
@@ -661,8 +702,43 @@ function removePoint(listName, index) {
   }
   const before = serializedProject();
   list.splice(index, 1);
+  if (editor.selectedVertex && editor.selectedVertex.objectId === object.id && editor.selectedVertex.setId === found.set.id) {
+    if (editor.selectedVertex.index === index) editor.selectedVertex = null;
+    else if (editor.selectedVertex.index > index) editor.selectedVertex.index -= 1;
+  }
   pushHistory(before);
   afterChange({ inspector: true });
+}
+
+function deleteSelectedVertex() {
+  const vertex = editor.selectedVertex;
+  if (!vertex) return false;
+  const set = project.sets.find((item) => item.id === vertex.setId);
+  const object = set?.objects.find((item) => item.id === vertex.objectId);
+  if (!set || !object || object.type === 'poi') {
+    editor.selectedVertex = null;
+    requestDraw();
+    return true;
+  }
+  const listName = object.type === 'line' ? 'line' : 'shape';
+  const list = object[listName];
+  const minimum = listName === 'line' ? 2 : 3;
+  if (!list || vertex.index < 0 || vertex.index >= list.length) {
+    editor.selectedVertex = null;
+    requestDraw();
+    return true;
+  }
+  if (list.length <= minimum) {
+    toast('Нельзя удалить последнюю точку', 'warn');
+    return true;
+  }
+  const before = serializedProject();
+  list.splice(vertex.index, 1);
+  editor.selectedVertex = null;
+  pushHistory(before);
+  afterChange({ inspector: true });
+  toast('Точка удалена', 'info', 1200);
+  return true;
 }
 
 function addSet() {
@@ -1405,6 +1481,11 @@ function onGlobalKeyDown(event) {
     }
     if (editor.draft) {
       cancelDraft();
+      event.preventDefault();
+      return;
+    }
+    if (editor.selectedVertex) {
+      deleteSelectedVertex();
       event.preventDefault();
       return;
     }
