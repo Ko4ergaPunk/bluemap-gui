@@ -1,0 +1,14 @@
+{
+  "name": "bluemap-config-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GUI editor and config generator for BlueMap markers, lines and shapes",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
